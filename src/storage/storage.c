@@ -61,7 +61,6 @@ esp_err_t storage_init(gpio_num_t stop, gpio_num_t stop_led, gpio_num_t mosi, gp
 	s_cs = cs;
 	s_cs_count = cs_count;
 	s_host = (sdmmc_host_t)SDSPI_HOST_DEFAULT();
-	s_host.max_freq_khz = 5000;
 	s_card = calloc(cs_count, sizeof(sdmmc_card_t *));
 	s_stop_semaphore = xSemaphoreCreateBinary();
 	s_storage_mux = xSemaphoreCreateMutex();

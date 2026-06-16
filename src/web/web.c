@@ -41,6 +41,37 @@ static SemaphoreHandle_t s_session_mux = NULL;
 static char s_file_lock[MAX_ACTIVE_FILES][256] = {0};
 static SemaphoreHandle_t s_file_lock_mux = NULL;
 
+static TimerHandle_t s_pmu_timer = NULL;
+static int s_active_requests = 0;
+static SemaphoreHandle_t s_pmu_mux = NULL;
+
+static void pmu_relax_cb(TimerHandle_t xTimer)
+{
+	esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+}
+
+static void pmu_activity_start()
+{
+	xSemaphoreTake(s_pmu_mux, portMAX_DELAY);
+	xTimerStop(s_pmu_timer, 0);
+	if (s_active_requests == 0) {
+		esp_wifi_set_ps(WIFI_PS_NONE);
+	}
+	s_active_requests++;
+	xSemaphoreGive(s_pmu_mux);
+}
+
+static void pmu_activity_end()
+{
+	xSemaphoreTake(s_pmu_mux, portMAX_DELAY);
+	s_active_requests--;
+	if (s_active_requests <= 0) {
+		s_active_requests = 0;
+		xTimerStart(s_pmu_timer, 0);
+	}
+	xSemaphoreGive(s_pmu_mux);
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
 	if (base == WIFI_EVENT && (id == WIFI_EVENT_STA_START || id == WIFI_EVENT_STA_DISCONNECTED)) {
@@ -791,6 +822,7 @@ static void handle_info(httpd_req_t *req)
 
 esp_err_t static api_handle(httpd_req_t *req)
 {
+	pmu_activity_start();
 	bool is_login = (strncmp(req->uri, "/api/login", 10) == 0);
 	bool auth_ok = false;
 
@@ -813,6 +845,7 @@ esp_err_t static api_handle(httpd_req_t *req)
 		if (!auth_ok) {
 			drain_body(req);
 			send_err(req, "Unauthorized");
+			pmu_activity_end();
 			return ESP_OK;
 		}
 	}
@@ -844,11 +877,13 @@ esp_err_t static api_handle(httpd_req_t *req)
 		send_err(req, "Unknown API endpoint");
 	}
 
+	pmu_activity_end();
 	return ESP_OK;
 }
 
 static esp_err_t page_handle(httpd_req_t *req)
 {
+	pmu_activity_start();
 	char uri_path[512];
 	strncpy(uri_path, req->uri, sizeof(uri_path) - 1);
 	uri_path[sizeof(uri_path) - 1] = '\0';
@@ -871,12 +906,14 @@ static esp_err_t page_handle(httpd_req_t *req)
 	    (strlen(path) >= 3 && strcmp(path + strlen(path) - 3, "/..") == 0) || strcmp(path, "..") == 0 ||
 	    strncmp(path, "/flash/web/", 11) != 0) {
 		httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Forbidden");
+		pmu_activity_end();
 		return ESP_FAIL;
 	}
 
 	struct stat st;
 	if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
 		httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not Found");
+		pmu_activity_end();
 		return ESP_FAIL;
 	}
 
@@ -884,6 +921,7 @@ static esp_err_t page_handle(httpd_req_t *req)
 
 	if (!f) {
 		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Error");
+		pmu_activity_end();
 		return ESP_FAIL;
 	}
 
@@ -916,6 +954,7 @@ static esp_err_t page_handle(httpd_req_t *req)
 	fclose(f);
 
 	httpd_resp_send_chunk(req, NULL, 0);
+	pmu_activity_end();
 	return ESP_OK;
 }
 
@@ -930,6 +969,8 @@ esp_err_t web_init(char *wifi_ssid, char *wifi_password, char *password, uint32_
 
 	s_session_mux = xSemaphoreCreateMutex();
 	s_file_lock_mux = xSemaphoreCreateMutex();
+	s_pmu_mux = xSemaphoreCreateMutex();
+	s_pmu_timer = xTimerCreate("pmu_timer", pdMS_TO_TICKS(10000), pdFALSE, NULL, pmu_relax_cb);
 
 	esp_err_t ret = nvs_flash_init();
 	if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
