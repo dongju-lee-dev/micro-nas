@@ -1,14 +1,91 @@
 <!DOCTYPE html>
-<html>
-
+<html lang="ko">
 <head>
-    <link rel="icon" href="/favicon.ico" type="image/x-icon">
-    <link rel="stylesheet" href="/style.css">
-    <script defer src="/script.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Micro NAS</title>
+    <link rel="stylesheet" href="style.css">
 </head>
-
 <body>
-<h1>Micro-NAS</h1>
-</body>
+    <div id="login-view" class="view hidden">
+        <div class="login-container">
+            <h1>Micro-NAS</h1>
+            <h3>Login</h3>
+            <input type="password" id="password" placeholder="Password">
+            <button id="login-btn">Login</button>
+        </div>
+    </div>
 
+    </div>
+
+    <div id="main-view" class="view hidden">
+        <header id="status-bar">
+            <div class="status-item">CPU: <span id="cpu-cores">0</span> Cores</div>
+            <div class="status-item">RAM: <span id="ram-usage">0</span>% (<span id="ram-free">0</span> KB)</div>
+            <div class="status-item">Uptime: <span id="uptime">0</span>s</div>
+            <div class="status-item">Wi-Fi: <span id="wifi-ssid">-</span> (<span id="wifi-rssi">0</span> dBm)</div>
+            <div class="status-item">Storage: <span id="mount-status">-</span></div>
+            <div id="upload-progress-container" class="status-item hidden">
+                Upload: <div class="progress-bar mini"><div id="upload-progress-fill" class="progress-fill"></div></div>
+                <span id="upload-progress-text">0%</span>
+            </div>
+            <div id="download-progress-container" class="status-item hidden">
+                Download: <div class="progress-bar mini"><div id="download-progress-fill" class="progress-fill"></div></div>
+                <span id="download-progress-text">0%</span>
+            </div>
+            <div class="status-item" id="logout-btn">Logout</div>
+        </header>
+
+        <div class="content-wrapper">
+            <aside id="sidebar">
+                <h2>Storages</h2>
+                <div id="storage-list"></div>
+            </aside>
+
+            <main id="explorer">
+                <div id="drop-overlay" class="drop-overlay hidden">
+                    <div class="drop-message">Drop files to upload</div>
+                </div>
+                <div class="toolbar">
+                    <button id="back-btn">Back</button>
+                    <button id="forward-btn">Forward</button>
+                    <input type="text" id="current-path" placeholder="Path">
+                    <button id="refresh-btn">Refresh</button>
+                    <button id="delete-selected-btn" class="hidden" style="color: red;">Delete Selected</button>
+                    <button id="mkdir-btn">New Folder</button>
+                    <button id="touch-btn">New File</button>
+                    <input type="file" id="upload-input" multiple style="display: none;">
+                    <button id="upload-btn">Upload</button>
+                </div>
+                <table id="file-table">
+                    <thead>
+                        <tr>
+                            <th style="width: 40px;"><input type="checkbox" id="select-all"></th>
+                            <th>Name</th>
+                        </tr>
+                    </thead>
+                    <tbody id="file-list"></tbody>
+                </table>
+            </main>
+        </div>
+    </div>
+
+    <div id="context-menu" class="context-menu hidden">
+        <div class="menu-item" id="menu-open">Open</div>
+        <div class="menu-item" id="menu-rename">Rename</div>
+        <div class="menu-item" id="menu-download">Download</div>
+        <div class="menu-item" id="menu-info">Properties</div>
+        <div class="menu-item" id="menu-delete" style="color: red;">Delete</div>
+    </div>
+
+    <div id="modal-overlay" class="modal-overlay hidden">
+        <div class="modal">
+            <h2 id="modal-title">Properties</h2>
+            <div id="modal-content" class="modal-content"></div>
+            <button id="modal-close">Close</button>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
 </html>

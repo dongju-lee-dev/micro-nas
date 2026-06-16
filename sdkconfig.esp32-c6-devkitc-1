@@ -2245,7 +2245,7 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_NONE=y
 # FAT Filesystem support
 #
 # default:
-CONFIG_FATFS_VOLUME_COUNT=2
+CONFIG_FATFS_VOLUME_COUNT=5
 # default:
 # CONFIG_FATFS_LFN_NONE is not set
 # default:

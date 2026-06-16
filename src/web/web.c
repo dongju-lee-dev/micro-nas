@@ -6,6 +6,7 @@
 #include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_vfs_fat.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -13,7 +14,9 @@
 #include "mdns.h"
 #include "nvs_flash.h"
 #include "storage/storage.h"
+#include <ctype.h>
 #include <dirent.h>
+#include <stdbool.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -48,6 +51,38 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 		mdns_instance_name_set("Micro NAS Storage");
 		mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
 	}
+}
+
+static void url_decode(char *dst, const char *src)
+{
+	char a, b;
+	while (*src) {
+		if ((*src == '%') && ((a = src[1]) && (b = src[2])) &&
+		    (isxdigit((unsigned char)a) && isxdigit((unsigned char)b))) {
+			if (a >= 'a')
+				a -= 'a' - 'A';
+			if (a >= 'A')
+				a -= ('A' - 10);
+			else
+				a -= '0';
+
+			if (b >= 'a')
+				b -= 'a' - 'A';
+			if (b >= 'A')
+				b -= ('A' - 10);
+			else
+				b -= '0';
+
+			*dst++ = 16 * a + b;
+			src += 3;
+		} else if (*src == '+') {
+			*dst++ = ' ';
+			src++;
+		} else {
+			*dst++ = *src++;
+		}
+	}
+	*dst = '\0';
 }
 
 static bool file_lock(const char *path, uint32_t timeout_ms)
@@ -101,6 +136,19 @@ static void file_unlock(const char *path)
 	xSemaphoreGive(s_file_lock_mux);
 }
 
+static bool is_valid_filename(const char *path)
+{
+	if (!path)
+		return false;
+	const char *invalid_chars = "<>:\"\\|?*";
+	while (*path) {
+		if (strchr(invalid_chars, *path))
+			return false;
+		path++;
+	}
+	return true;
+}
+
 static bool is_storage_path(const char *path)
 {
 	if (!path || strlen(path) >= 256)
@@ -112,6 +160,25 @@ static bool is_storage_path(const char *path)
 	}
 
 	return strncmp(path, "/storage_", 9) == 0;
+}
+
+static void drain_body(httpd_req_t *req)
+{
+	if (req->content_len <= 0)
+		return;
+
+	char buf[128];
+	int ret;
+	int remaining = req->content_len;
+	while (remaining > 0) {
+		ret = httpd_req_recv(req, buf, remaining > sizeof(buf) ? sizeof(buf) : remaining);
+		if (ret <= 0) {
+			if (ret == HTTPD_SOCK_ERR_TIMEOUT)
+				continue;
+			break;
+		}
+		remaining -= ret;
+	}
 }
 
 static void send_json_resp(httpd_req_t *req, cJSON *root)
@@ -144,20 +211,14 @@ static cJSON *read_json_body(httpd_req_t *req)
 		return NULL;
 
 	if (req->content_len > 4096) {
-		char drain_buf[128];
-		int remaining = req->content_len;
-		while (remaining > 0) {
-			int ret = httpd_req_recv(req, drain_buf, remaining > 128 ? 128 : remaining);
-			if (ret <= 0)
-				break;
-			remaining -= ret;
-		}
+		drain_body(req);
 		send_err(req, "Body too large");
 		return NULL;
 	}
 
 	char *buf = malloc(req->content_len + 1);
 	if (!buf) {
+		drain_body(req);
 		send_err(req, "Out of memory");
 		return NULL;
 	}
@@ -233,8 +294,6 @@ static void handle_status(httpd_req_t *req)
 	esp_chip_info_t chip_info;
 	esp_chip_info(&chip_info);
 	cJSON_AddNumberToObject(cpu, "cores", chip_info.cores);
-	cJSON_AddNumberToObject(cpu, "model", chip_info.model);
-	cJSON_AddNumberToObject(cpu, "revision", chip_info.revision);
 
 	cJSON_AddNumberToObject(root, "uptime", esp_timer_get_time() / 1000000);
 	cJSON_AddBoolToObject(root, "storage_mounted", storage_is_mount());
@@ -254,7 +313,7 @@ static void handle_status(httpd_req_t *req)
 		esp_netif_ip_info_t ip_info;
 		if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
 			char ip_str[16];
-			sprintf(ip_str, IPSTR, IP2STR(&ip_info.ip));
+			snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&ip_info.ip));
 			cJSON_AddStringToObject(wifi, "ip", ip_str);
 		}
 	}
@@ -264,17 +323,28 @@ static void handle_status(httpd_req_t *req)
 	for (int i = 0; i < count; i++) {
 		char p[32];
 		snprintf(p, sizeof(p), "/storage_%d", i);
-		struct statvfs st;
+
+		uint64_t total_bytes = 0;
+		uint64_t free_bytes = 0;
+
+		esp_err_t ret = esp_vfs_fat_info(p, &total_bytes, &free_bytes);
+
 		cJSON *card = cJSON_CreateObject();
 		cJSON_AddNumberToObject(card, "id", i);
 		cJSON_AddStringToObject(card, "path", p);
 
-		if (statvfs(p, &st) == 0) {
-			cJSON_AddNumberToObject(card, "total", (double)st.f_blocks * st.f_frsize);
-			cJSON_AddNumberToObject(card, "used", (double)(st.f_blocks - st.f_bfree) * st.f_frsize);
-			cJSON_AddNumberToObject(card, "free", (double)st.f_bfree * st.f_frsize);
+		if (ret == ESP_OK) {
+			uint64_t used_bytes = total_bytes - free_bytes;
+
+			cJSON_AddNumberToObject(card, "total", (double)total_bytes);
+			cJSON_AddNumberToObject(card, "used", (double)used_bytes);
+			cJSON_AddNumberToObject(card, "free", (double)free_bytes);
 			cJSON_AddBoolToObject(card, "active", true);
 		} else {
+			ESP_LOGW("web", "Storage %d (%s) not ready or info failed", i, p);
+			cJSON_AddNumberToObject(card, "total", 0);
+			cJSON_AddNumberToObject(card, "used", 0);
+			cJSON_AddNumberToObject(card, "free", 0);
 			cJSON_AddBoolToObject(card, "active", false);
 		}
 		cJSON_AddItemToArray(cards, card);
@@ -371,22 +441,38 @@ static void handle_search(httpd_req_t *req)
 
 static void handle_upload(httpd_req_t *req)
 {
-	char q[256], path[256];
+	char q[256], raw_path[256], path[256];
 	if (httpd_req_get_url_query_str(req, q, 256) == ESP_OK &&
-	    httpd_query_key_value(q, "path", path, 256) == ESP_OK && is_storage_path(path)) {
+	    httpd_query_key_value(q, "path", raw_path, 256) == ESP_OK) {
+
+		url_decode(path, raw_path);
+
+		if (!is_storage_path(path)) {
+			drain_body(req);
+			send_err(req, "Invalid path");
+			return;
+		}
 
 		if (!file_lock(path, 5000)) {
+			drain_body(req);
 			send_err(req, "File is busy");
 			return;
 		}
 
 		FILE *f = fopen(path, "wb");
 		if (f) {
-			char buf[1024];
+			char *buf = malloc(4096);
+			if (!buf) {
+				fclose(f);
+				drain_body(req);
+				file_unlock(path);
+				send_err(req, "Out of memory");
+				return;
+			}
 			int ret, received = 0;
 			bool ok = true;
 			while (received < req->content_len) {
-				ret = httpd_req_recv(req, buf, 1024);
+				ret = httpd_req_recv(req, buf, 4096);
 				if (ret <= 0) {
 					if (ret == HTTPD_SOCK_ERR_TIMEOUT)
 						continue;
@@ -401,17 +487,22 @@ static void handle_upload(httpd_req_t *req)
 				received += ret;
 			}
 
+			free(buf);
 			fclose(f);
-			if (!ok)
+			if (!ok) {
+				drain_body(req);
 				remove(path);
+			}
 
 			file_unlock(path);
 			ok ? send_ok(req) : send_err(req, "Upload failed");
 		} else {
+			drain_body(req);
 			file_unlock(path);
 			send_err(req, "File open failed");
 		}
 	} else {
+		drain_body(req);
 		send_err(req, "Invalid path");
 	}
 }
@@ -438,19 +529,28 @@ static void handle_download(httpd_req_t *req)
 
 		FILE *f = fopen(path, "rb");
 		if (f) {
+			fseek(f, 0, SEEK_END);
+			size_t size = ftell(f);
+			fseek(f, 0, SEEK_SET);
+
 			httpd_resp_set_type(req, "application/octet-stream");
 
 			char hdr[512], *fn = strrchr(path, '/') + 1;
 			snprintf(hdr, 512, "attachment; filename=\"%s\"", fn);
-
 			httpd_resp_set_hdr(req, "Content-Disposition", hdr);
+
+			char size_str[16];
+			snprintf(size_str, 16, "%u", size);
+			httpd_resp_set_hdr(req, "Content-Length", size_str);
+
 			char buf[1024];
 			size_t n;
 			while (1) {
 				n = fread(buf, 1, 1024, f);
 				if (n <= 0)
 					break;
-				httpd_resp_send_chunk(req, buf, n);
+				if (httpd_resp_send_chunk(req, buf, n) != ESP_OK)
+					break;
 			}
 			fclose(f);
 			file_unlock(path);
@@ -475,7 +575,7 @@ static void handle_new(httpd_req_t *req)
 	cJSON *path_obj = cJSON_GetObjectItem(json, "path");
 	const char *path = (path_obj && cJSON_IsString(path_obj)) ? path_obj->valuestring : NULL;
 
-	if (is_storage_path(path)) {
+	if (is_storage_path(path) && is_valid_filename(strrchr(path, '/') ? strrchr(path, '/') + 1 : path)) {
 		if (!file_lock(path, 5000)) {
 			send_err(req, "File is busy");
 			cJSON_Delete(json);
@@ -489,7 +589,7 @@ static void handle_new(httpd_req_t *req)
 		else
 			send_err(req, "Mkdir failed");
 	} else {
-		send_err(req, "Invalid path");
+		send_err(req, "Invalid path or name");
 	}
 	cJSON_Delete(json);
 }
@@ -503,7 +603,7 @@ static void handle_touch(httpd_req_t *req)
 	cJSON *path_obj = cJSON_GetObjectItem(json, "path");
 	const char *path = (path_obj && cJSON_IsString(path_obj)) ? path_obj->valuestring : NULL;
 
-	if (is_storage_path(path)) {
+	if (is_storage_path(path) && is_valid_filename(strrchr(path, '/') ? strrchr(path, '/') + 1 : path)) {
 		if (!file_lock(path, 5000)) {
 			send_err(req, "File is busy");
 			cJSON_Delete(json);
@@ -519,9 +619,44 @@ static void handle_touch(httpd_req_t *req)
 			send_err(req, "Touch failed");
 		}
 	} else {
-		send_err(req, "Invalid path");
+		send_err(req, "Invalid path or name");
 	}
 	cJSON_Delete(json);
+}
+
+static bool delete_recursive(const char *path)
+{
+	struct stat st;
+	if (stat(path, &st) != 0)
+		return false;
+
+	if (!S_ISDIR(st.st_mode))
+		return (remove(path) == 0);
+
+	DIR *dir = opendir(path);
+	if (!dir)
+		return false;
+
+	struct dirent *ent;
+	bool ok = true;
+	while ((ent = readdir(dir)) != NULL) {
+		if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+			continue;
+
+		char *subpath = malloc(512);
+		if (subpath) {
+			snprintf(subpath, 512, "%s/%s", path, ent->d_name);
+			if (!delete_recursive(subpath))
+				ok = false;
+			free(subpath);
+		} else {
+			ok = false;
+		}
+	}
+	closedir(dir);
+	if (ok)
+		ok = (rmdir(path) == 0);
+	return ok;
 }
 
 static void handle_delete(httpd_req_t *req)
@@ -534,20 +669,13 @@ static void handle_delete(httpd_req_t *req)
 	const char *path = (path_obj && cJSON_IsString(path_obj)) ? path_obj->valuestring : NULL;
 
 	if (is_storage_path(path)) {
-		bool ok = false;
-
 		if (!file_lock(path, 5000)) {
 			send_err(req, "File is busy");
 			cJSON_Delete(json);
 			return;
 		}
-		struct stat st;
-		if (stat(path, &st) == 0) {
-			if (S_ISDIR(st.st_mode))
-				ok = (rmdir(path) == 0);
-			else
-				ok = (remove(path) == 0);
-		}
+
+		bool ok = delete_recursive(path);
 		file_unlock(path);
 
 		if (ok)
@@ -571,14 +699,31 @@ static void handle_rename(httpd_req_t *req)
 
 	if (is_storage_path(path)) {
 		cJSON *np = cJSON_GetObjectItem(json, "new");
-		if (np && is_storage_path(np->valuestring)) {
+		const char *new_path = (np && cJSON_IsString(np)) ? np->valuestring : NULL;
+
+		if (new_path && is_storage_path(new_path)) {
+			const char *old_name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+			const char *new_name = strrchr(new_path, '/') ? strrchr(new_path, '/') + 1 : new_path;
+
+			if (!is_valid_filename(old_name) || !is_valid_filename(new_name)) {
+				send_err(req, "Invalid filename");
+				cJSON_Delete(json);
+				return;
+			}
+
 			bool ok = false;
 			const char *err_msg = "Rename failed";
 
+			if (strcasecmp(path, new_path) == 0) {
+				send_ok(req);
+				cJSON_Delete(json);
+				return;
+			}
+
 			const char *lock_first = path;
-			const char *lock_second = np->valuestring;
+			const char *lock_second = new_path;
 			if (strcasecmp(lock_first, lock_second) > 0) {
-				lock_first = np->valuestring;
+				lock_first = new_path;
 				lock_second = path;
 			}
 
@@ -594,10 +739,10 @@ static void handle_rename(httpd_req_t *req)
 				return;
 			}
 
-			if (access(np->valuestring, F_OK) == 0) {
+			if (access(new_path, F_OK) == 0) {
 				err_msg = "Target exists";
 			} else {
-				ok = (rename(path, np->valuestring) == 0);
+				ok = (rename(path, new_path) == 0);
 			}
 
 			file_unlock(lock_second);
@@ -616,9 +761,37 @@ static void handle_rename(httpd_req_t *req)
 	cJSON_Delete(json);
 }
 
+static void handle_info(httpd_req_t *req)
+{
+	cJSON *json = read_json_body(req);
+	if (!json)
+		return;
+
+	cJSON *path_obj = cJSON_GetObjectItem(json, "path");
+	const char *path = (path_obj && cJSON_IsString(path_obj)) ? path_obj->valuestring : NULL;
+
+	if (is_storage_path(path)) {
+		struct stat st;
+		if (stat(path, &st) == 0) {
+			cJSON *root = cJSON_CreateObject();
+			cJSON_AddStringToObject(root, "status", "success");
+			cJSON_AddStringToObject(root, "name", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
+			cJSON_AddNumberToObject(root, "size", (double)st.st_size);
+			cJSON_AddNumberToObject(root, "mtime", (double)st.st_mtime);
+			cJSON_AddBoolToObject(root, "is_dir", S_ISDIR(st.st_mode));
+			send_json_resp(req, root);
+		} else {
+			send_err(req, "Stat failed");
+		}
+	} else {
+		send_err(req, "Invalid path");
+	}
+	cJSON_Delete(json);
+}
+
 esp_err_t static api_handle(httpd_req_t *req)
 {
-	bool is_login = (strcmp(req->uri, "/api/login") == 0);
+	bool is_login = (strncmp(req->uri, "/api/login", 10) == 0);
 	bool auth_ok = false;
 
 	if (!is_login) {
@@ -638,48 +811,36 @@ esp_err_t static api_handle(httpd_req_t *req)
 		}
 
 		if (!auth_ok) {
-			char drain_buf[128];
-			int remaining = req->content_len;
-			while (remaining > 0) {
-				int ret = httpd_req_recv(req, drain_buf, remaining > 128 ? 128 : remaining);
-				if (ret <= 0)
-					break;
-				remaining -= ret;
-			}
+			drain_body(req);
 			send_err(req, "Unauthorized");
 			return ESP_OK;
 		}
 	}
 
-	if (strcmp(req->uri, "/api/login") == 0)
+	if (strncmp(req->uri, "/api/login", 10) == 0)
 		handle_login(req);
-	else if (strcmp(req->uri, "/api/status") == 0)
+	else if (strncmp(req->uri, "/api/status", 11) == 0)
 		handle_status(req);
-	else if (strcmp(req->uri, "/api/upload") == 0)
+	else if (strncmp(req->uri, "/api/info", 9) == 0)
+		handle_info(req);
+	else if (strncmp(req->uri, "/api/upload", 11) == 0)
 		handle_upload(req);
-	else if (strcmp(req->uri, "/api/list") == 0)
+	else if (strncmp(req->uri, "/api/list", 9) == 0)
 		handle_list(req);
-	else if (strcmp(req->uri, "/api/search") == 0)
+	else if (strncmp(req->uri, "/api/search", 11) == 0)
 		handle_search(req);
-	else if (strcmp(req->uri, "/api/download") == 0)
+	else if (strncmp(req->uri, "/api/download", 13) == 0)
 		handle_download(req);
-	else if (strcmp(req->uri, "/api/new") == 0)
+	else if (strncmp(req->uri, "/api/new", 8) == 0)
 		handle_new(req);
-	else if (strcmp(req->uri, "/api/touch") == 0)
+	else if (strncmp(req->uri, "/api/touch", 10) == 0)
 		handle_touch(req);
-	else if (strcmp(req->uri, "/api/delete") == 0)
+	else if (strncmp(req->uri, "/api/delete", 11) == 0)
 		handle_delete(req);
-	else if (strcmp(req->uri, "/api/rename") == 0)
+	else if (strncmp(req->uri, "/api/rename", 11) == 0)
 		handle_rename(req);
 	else {
-		char drain_buf[128];
-		int remaining = req->content_len;
-		while (remaining > 0) {
-			int ret = httpd_req_recv(req, drain_buf, remaining > 128 ? 128 : remaining);
-			if (ret <= 0)
-				break;
-			remaining -= ret;
-		}
+		drain_body(req);
 		send_err(req, "Unknown API endpoint");
 	}
 
@@ -688,11 +849,23 @@ esp_err_t static api_handle(httpd_req_t *req)
 
 static esp_err_t page_handle(httpd_req_t *req)
 {
+	char uri_path[512];
+	strncpy(uri_path, req->uri, sizeof(uri_path) - 1);
+	uri_path[sizeof(uri_path) - 1] = '\0';
+
+	char *query_ptr = strchr(uri_path, '?');
+	if (query_ptr)
+		*query_ptr = '\0';
+
+	char *hash_ptr = strchr(uri_path, '#');
+	if (hash_ptr)
+		*hash_ptr = '\0';
+
 	char path[512 + 11];
-	if (strcmp(req->uri, "/") == 0)
+	if (strcmp(uri_path, "/") == 0)
 		strcpy(path, "/flash/web/index.html");
 	else
-		snprintf(path, sizeof(path), "/flash/web%s", req->uri);
+		snprintf(path, sizeof(path), "/flash/web%s", uri_path);
 
 	if (strstr(path, "/../") != NULL || strncmp(path, "../", 3) == 0 ||
 	    (strlen(path) >= 3 && strcmp(path + strlen(path) - 3, "/..") == 0) || strcmp(path, "..") == 0 ||
@@ -714,14 +887,21 @@ static esp_err_t page_handle(httpd_req_t *req)
 		return ESP_FAIL;
 	}
 
-	if (strstr(path, ".html"))
-		httpd_resp_set_type(req, "text/html");
-	else if (strstr(path, ".css"))
-		httpd_resp_set_type(req, "text/css");
-	else if (strstr(path, ".js"))
-		httpd_resp_set_type(req, "application/javascript");
-	else if (strstr(path, ".ico"))
-		httpd_resp_set_type(req, "image/x-icon");
+	const char *ext = strrchr(path, '.');
+	if (ext) {
+		if (strcasecmp(ext, ".html") == 0)
+			httpd_resp_set_type(req, "text/html");
+		else if (strcasecmp(ext, ".css") == 0)
+			httpd_resp_set_type(req, "text/css");
+		else if (strcasecmp(ext, ".js") == 0)
+			httpd_resp_set_type(req, "application/javascript");
+		else if (strcasecmp(ext, ".ico") == 0)
+			httpd_resp_set_type(req, "image/x-icon");
+		else
+			httpd_resp_set_type(req, "text/plain");
+	} else {
+		httpd_resp_set_type(req, "application/octet-stream");
+	}
 
 	char buf[1024];
 	size_t n;
@@ -729,7 +909,8 @@ static esp_err_t page_handle(httpd_req_t *req)
 		n = fread(buf, 1, 1024, f);
 		if (n <= 0)
 			break;
-		httpd_resp_send_chunk(req, buf, n);
+		if (httpd_resp_send_chunk(req, buf, n) != ESP_OK)
+			break;
 	}
 
 	fclose(f);
@@ -776,6 +957,7 @@ esp_err_t web_init(char *wifi_ssid, char *wifi_password, char *password, uint32_
 	httpd_handle_t server = NULL;
 	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 	config.max_uri_handlers = 20;
+	config.uri_match_fn = httpd_uri_match_wildcard;
 	ESP_ERROR_CHECK(httpd_start(&server, &config));
 
 	httpd_uri_t page = {.uri = "/*", .method = HTTP_GET, .handler = page_handle};

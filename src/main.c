@@ -67,7 +67,7 @@ void app_main()
 			miso = atoi(val);
 		else if (strcmp(key, "SPI_SCLK") == 0)
 			sclk = atoi(val);
-		else if (strncmp(key, "SPI_SC_", 7) == 0) {
+		else if (strncmp(key, "SPI_CS_", 7) == 0) {
 			gpio_num_t *temp = realloc(cs, sizeof(gpio_num_t) * ++cs_count);
 			if (temp == NULL) {
 				ESP_LOGI("main", "out of memory");

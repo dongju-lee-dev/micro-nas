@@ -16,20 +16,29 @@ static size_t s_cs_count;
 static sdmmc_host_t s_host;
 static sdmmc_card_t **s_card;
 static SemaphoreHandle_t s_stop_semaphore;
+static SemaphoreHandle_t s_storage_mux;
 static bool s_is_mount;
 
 static void storage_stop_task(void *pvParameters)
 {
+	int last = 1;
+
 	while (1) {
 		if (xSemaphoreTake(s_stop_semaphore, portMAX_DELAY) == pdTRUE) {
-			vTaskDelay(pdMS_TO_TICKS(100));
+			vTaskDelay(pdMS_TO_TICKS(500));
+			while (xSemaphoreTake(s_stop_semaphore, 0) == pdTRUE)
+				;
 
-			if (gpio_get_level(s_stop) == 0) {
-				gpio_set_level(s_stop_led, 1);
-				storage_unmount();
-			} else {
-				gpio_set_level(s_stop_led, 0);
-				storage_mount();
+			int now = gpio_get_level(s_stop);
+			if (now != last) {
+				if (now == 0) {
+					gpio_set_level(s_stop_led, 1);
+					storage_unmount();
+				} else {
+					gpio_set_level(s_stop_led, 0);
+					storage_mount();
+				}
+				last = now;
 			}
 		}
 	}
@@ -52,10 +61,21 @@ esp_err_t storage_init(gpio_num_t stop, gpio_num_t stop_led, gpio_num_t mosi, gp
 	s_cs = cs;
 	s_cs_count = cs_count;
 	s_host = (sdmmc_host_t)SDSPI_HOST_DEFAULT();
-	s_host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+	s_host.max_freq_khz = 5000;
 	s_card = calloc(cs_count, sizeof(sdmmc_card_t *));
 	s_stop_semaphore = xSemaphoreCreateBinary();
+	s_storage_mux = xSemaphoreCreateMutex();
 	s_is_mount = false;
+
+	for (size_t i = 0; i < cs_count; i++) {
+		gpio_config_t cs_cfg = {
+		    .pin_bit_mask = (1ULL << cs[i]),
+		    .mode = GPIO_MODE_OUTPUT,
+		    .pull_up_en = GPIO_PULLUP_ENABLE,
+		};
+		gpio_config(&cs_cfg);
+		gpio_set_level(cs[i], 1);
+	}
 
 	spi_bus_config_t config = {
 	    .mosi_io_num = mosi,
@@ -67,7 +87,10 @@ esp_err_t storage_init(gpio_num_t stop, gpio_num_t stop_led, gpio_num_t mosi, gp
 	    .intr_flags = ESP_INTR_FLAG_IRAM,
 	};
 
-	ESP_ERROR_CHECK(spi_bus_initialize(s_host.slot, &config, SDSPI_DEFAULT_DMA));
+	esp_err_t err = spi_bus_initialize(s_host.slot, &config, SDSPI_DEFAULT_DMA);
+	if (err != ESP_OK) {
+		return err;
+	}
 
 	gpio_config_t stop_io_cfg = {
 	    .pin_bit_mask = (1ULL << stop),
@@ -86,23 +109,37 @@ esp_err_t storage_init(gpio_num_t stop, gpio_num_t stop_led, gpio_num_t mosi, gp
 	    .intr_type = GPIO_INTR_DISABLE,
 	};
 	gpio_config(&stop_led_is_cfg);
-	gpio_set_level(stop_led, 0);
 
-	gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+	err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+	if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+		return err;
+	}
 	gpio_isr_handler_add(stop, storage_stop_button, NULL);
 
 	xTaskCreate(storage_stop_task, "storage_stop_task", 4096, NULL, 10, NULL);
 
-	storage_mount();
+	if (gpio_get_level(s_stop) != 0) {
+		gpio_set_level(s_stop_led, 0);
+		storage_mount();
+	} else {
+		gpio_set_level(s_stop_led, 1);
+	}
+
+	ESP_LOGI("storage", "init end");
 
 	return ESP_OK;
 }
 
 void storage_mount()
 {
+	xSemaphoreTake(s_storage_mux, portMAX_DELAY);
 	for (size_t i = 0; i < s_cs_count; i++) {
+		if (s_card[i] != NULL) {
+			continue;
+		}
+
 		char base_path[16];
-		sprintf(base_path, "/storage_%d", i);
+		snprintf(base_path, sizeof(base_path), "/storage_%d", i);
 
 		sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
 		slot_config.host_id = s_host.slot;
@@ -111,7 +148,7 @@ void storage_mount()
 		esp_vfs_fat_mount_config_t mount_config = {
 		    .format_if_mount_failed = false,
 		    .max_files = 5,
-		    .allocation_unit_size = 512,
+		    .allocation_unit_size = 0,
 		    .disk_status_check_enable = false,
 		    .use_one_fat = false,
 		};
@@ -120,21 +157,24 @@ void storage_mount()
 	}
 
 	s_is_mount = true;
+	xSemaphoreGive(s_storage_mux);
 }
 
 void storage_unmount()
 {
+	xSemaphoreTake(s_storage_mux, portMAX_DELAY);
 	for (size_t i = 0; i < s_cs_count; i++) {
 		if (s_card[i] == NULL)
 			continue;
 
 		char base_path[16];
-		sprintf(base_path, "/storage_%d", i);
+		snprintf(base_path, sizeof(base_path), "/storage_%d", i);
 		esp_vfs_fat_sdcard_unmount(base_path, s_card[i]);
 		s_card[i] = NULL;
 	}
 
 	s_is_mount = false;
+	xSemaphoreGive(s_storage_mux);
 }
 
 bool storage_is_mount()
